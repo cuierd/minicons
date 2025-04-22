@@ -1790,6 +1790,9 @@ class IncrementalLMScorer(LMScorer):
 
         ## Set up storage variables
         scores = []
+        entropies = []
+        renyi_entropies = []
+        min_surprisals = []
         if rank:
             ranks = []
 
@@ -1802,6 +1805,12 @@ class IncrementalLMScorer(LMScorer):
             query_ids = idx[offset:]
             logit = logit.squeeze(0)
             logprob_distribution = logit - logit.logsumexp(1).unsqueeze(1)
+            prob_distribution = logprob_distribution.exp()
+            # compute entropy per step
+            entropy = -1.0 * (prob_distribution * logprob_distribution).sum(1)
+            renyi_entropy= 2.0 * torch.log(torch.sqrt(prob_distribution).sum(1))
+            # Compute min surprisal (i.e., negative log of max probability)
+            min_surprisal = -1.0 * logprob_distribution.max(1).values
 
             actual_logprob_distribution = logprob_distribution[
                 torch.arange(offset, length),
@@ -1870,6 +1879,9 @@ class IncrementalLMScorer(LMScorer):
                 Log_2(X) = log_e(X)/log_e(2) (broadcasted)
                 """
                 score = score / torch.tensor(2).log()
+                entropy = entropy / torch.tensor(2.0).log()
+                renyi_entropy = renyi_entropy / torch.tensor(2.0).log()
+                min_surprisal = min_surprisal / torch.tensor(2.0).log()
             else:
                 if prob:
                     score = score.exp()
@@ -1899,15 +1911,21 @@ class IncrementalLMScorer(LMScorer):
                 ranks.append(word_ranks)
 
             scores.append(score)
+            entropies.append(entropy[offset:length])
+            renyi_entropies.append(renyi_entropy[offset:length])
+            min_surprisals.append(min_surprisal[offset:length])
 
         if not return_tensors:
             # scores = [torch.tensor(l).detach() for l in scores]
             scores = [s.tolist() for s in scores]
+            entropies = [e.tolist() for e in entropies]
+            renyi_entropies = [r.tolist() for r in renyi_entropies]
+            min_surprisals = [m.tolist() for m in min_surprisals]
 
         if rank:
-            return scores, ranks
+            return scores, ranks, entropies, renyi_entropies, min_surprisals
         else:
-            return scores
+            return scores, entropies, renyi_entropies, min_surprisals
 
     def sequence_score(
         self,
@@ -1968,7 +1986,7 @@ class IncrementalLMScorer(LMScorer):
 
         tokenized = self.prepare_text(batch, **kwargs)
         if rank:
-            scores, ranks = self.compute_stats(
+            scores, ranks, entropies, renyi_entropies, min_surprisals = self.compute_stats(
                 tokenized,
                 rank=rank,
                 prob=prob,
@@ -1977,7 +1995,7 @@ class IncrementalLMScorer(LMScorer):
                 return_tensors=True,
             )
         else:
-            scores = self.compute_stats(
+            scores, entropies, renyi_entropies, min_surprisals = self.compute_stats(
                 tokenized,
                 prob=prob,
                 base_two=base_two,
@@ -1989,6 +2007,9 @@ class IncrementalLMScorer(LMScorer):
             scores = [-1.0 * s for s in scores]
 
         scores = [s.tolist() for s in scores]
+        entropies = [e.tolist() for e in entropies]
+        renyi_entropies = [r.tolist() for r in renyi_entropies]
+        min_surprisals = [m.tolist() for m in min_surprisals]
 
         # indices = [
         #     [i for i in indexed if i != self.tokenizer.pad_token_id]
@@ -2003,9 +2024,10 @@ class IncrementalLMScorer(LMScorer):
             )
         ]
         if decode:
-            tokens = [self.decode(idx) for idx in indices]
+            tokens = [self.decode(idx).lstrip("Ġ ") for idx in indices]
         else:
-            tokens = [self.tokenizer.convert_ids_to_tokens(idx) for idx in indices]
+            # convert_ids_to_tokens gives list of tokens — we need to strip Ġ from each
+            tokens = [[t.lstrip("Ġ") for t in self.tokenizer.convert_ids_to_tokens(idx)] for idx in indices]
 
         if rank:
             assert len(tokens) == len(scores) == len(ranks)
@@ -2014,23 +2036,30 @@ class IncrementalLMScorer(LMScorer):
 
         res = []
         if rank:
-            for t, s, r in zip(tokens, scores, ranks):
+            for t, s, r, e, re, ms in zip(tokens, scores, ranks, entropies, renyi_entropies, min_surprisals):
                 if len(t) > len(s):
                     diff = len(t) - len(s)
                     sc = [0.0] * diff + s
                     ra = [0] * diff + r
-                    res.append(list(zip(t, sc, ra)))
+                    ent = [0.0] * diff + e
+                    ren = [0.0] * diff + re
+                    msurp = [0.0] * diff + ms
+                    res.append(list(zip(t, sc, ra, ent, ren, msurp)))
                 else:
-                    res.append(list(zip(t, sc, ra)))
+                    # res.append(list(zip(t, sc, ra)))
+                    res.append(list(zip(t, s, r, e, re, ms)))
             # return [list(zip(t, s, r)) for t, s, r in zip(tokens, scores, ranks)]
         else:
-            for t, s in zip(tokens, scores):
+            for t, s, e, re, ms in zip(tokens, scores, entropies, renyi_entropies, min_surprisals):
                 if len(t) > len(s):
                     diff = len(t) - len(s)
                     sc = [0.0] * diff + s
-                    res.append(list(zip(t, sc)))
+                    ent = [0.0] * diff + e
+                    ren = [0.0] * diff + re
+                    msurp = [0.0] * diff + ms
+                    res.append(list(zip(t, sc, ent, ren, msurp)))
                 else:
-                    res.append(list(zip(t, sc)))
+                    res.append(list(zip(t, s, e, re, ms)))
 
         return res
 
@@ -2074,7 +2103,7 @@ class IncrementalLMScorer(LMScorer):
             batch, bos_token=bos_token, eos_token=eos_token
         )
 
-        scores = self.compute_stats(
+        scores, entropies, renyi_entropies, min_surprisals = self.compute_stats(
             (encoded, offsets),
             bow_correction=bow_correction,
             prob=prob,
@@ -2085,7 +2114,19 @@ class IncrementalLMScorer(LMScorer):
         if surprisal:
             scores = [-1.0 * s for s in scores]
 
+        scores = [torch.cat([torch.tensor([0.0], device=s.device), s]) for s in scores]
+        entropies = [
+            torch.cat([torch.tensor([0.0], device=e.device), e]) for e in entropies
+        ]
+        renyi_entropies = [
+            torch.cat([torch.tensor([0.0], device=r.device), r]) for r in renyi_entropies
+        ]
+        min_surprisals = [
+            torch.cat([torch.tensor([0.0], device=m.device), m]) for m in min_surprisals
+        ]
+
         spans, words = self.word_spans_tokenized(tokenized, tokenize_function)
+        # print(spans, words)
 
         word_scores = []
         for i, span in enumerate(spans):
@@ -2095,10 +2136,20 @@ class IncrementalLMScorer(LMScorer):
                     score = scores[i][s:e].prod()
                 else:
                     score = scores[i][s:e].sum()
+                    entropy = entropies[i][s:e].sum()
+                    renyi_entropy = renyi_entropies[i][s:e].sum()
+                    min_surprisal = min_surprisals[i][s:e].sum()
+                    # msurp = (scores[i][s:e].sum() / (e - s)).item()
+                    # mentropy = (entropies[i][s:e].sum() / (e - s)).item()
+                    # mrenyi_entropy = (renyi_entropies[i][s:e].sum() / (e - s)).item()
+                    # mmin_surprisal = ( min_surprisals[i][s:e].sum() / (e - s)).item()
                 if not return_tensors:
                     score = score.item()
+                    entropy = entropy.item()
+                    renyi_entropy = renyi_entropy.item()
+                    min_surprisal = min_surprisal.item()
 
-                ws.append((words[i][j], score))
+                ws.append((words[i][j], score, entropy, renyi_entropy, min_surprisal))
             word_scores.append(ws)
 
         return word_scores
